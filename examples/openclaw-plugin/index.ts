@@ -13,6 +13,7 @@ import {
   extractLatestUserText,
   sanitizeUserTextForCapture,
   shouldBypassSession,
+  extractNewTurnMessages,
 } from "./text-utils.js";
 import {
   clampScore,

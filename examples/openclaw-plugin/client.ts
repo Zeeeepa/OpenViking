@@ -411,6 +411,57 @@ export class OpenVikingClient {
     );
   }
 
+  /**
+   * Add a message with parts (text, tool, context).
+   * Used for sending structured messages with multiple part types.
+   */
+  async addSessionMessageWithParts(
+    sessionId: string,
+    role: string,
+    parts: Array<{
+      type: "text" | "tool" | "context";
+      text?: string;
+      tool_name?: string;
+      tool_output?: string;
+      tool_status?: string;
+      tool_input?: Record<string, unknown>;
+      tool_id?: string;
+      uri?: string;
+      abstract?: string;
+      context_type?: "memory" | "resource" | "skill";
+    }>,
+    agentId?: string,
+    createdAt?: string,
+  ): Promise<void> {
+    const body: {
+      role: string;
+      parts: typeof parts;
+      created_at?: string;
+    } = { role, parts };
+    if (createdAt) {
+      body.created_at = createdAt;
+    }
+    await this.emitRoutingDebug(
+      "session message POST (with parts)",
+      {
+        path: `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+        sessionId,
+        role,
+        partCount: parts.length,
+        created_at: createdAt ?? null,
+      },
+      agentId,
+    );
+    await this.request<{ session_id: string }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+      agentId,
+    );
+  }
+
   /** GET session — server auto-creates if absent; returns session meta including message stats and token usage. */
   async getSession(sessionId: string, agentId?: string): Promise<{
     message_count?: number;

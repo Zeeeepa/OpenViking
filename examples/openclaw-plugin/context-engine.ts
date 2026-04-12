@@ -4,7 +4,7 @@ import type { MemoryOpenVikingConfig } from "./config.js";
 import {
   compileSessionPatterns,
   getCaptureDecision,
-  extractNewTurnTexts,
+  extractNewTurnMessages,
   extractSingleMessageText,
   shouldBypassSession,
 } from "./text-utils.js";
@@ -171,7 +171,7 @@ function messageDigest(messages: AgentMessage[], maxCharsPerMsg = 2000): Array<{
   });
 }
 
-function emitDiag(log: typeof logger, stage: string, sessionId: string, data: Record<string, unknown>, enabled = true): void {
+function emitDiag(log: Logger, stage: string, sessionId: string, data: Record<string, unknown>, enabled = true): void {
   if (!enabled) return;
   log.info(`openviking: diag ${JSON.stringify({ ts: Date.now(), stage, sessionId, data })}`);
 }
@@ -450,7 +450,7 @@ async function pollPhase2ExtractionOutcome(
     while (Date.now() < deadline) {
       await sleep(PHASE2_POLL_INTERVAL_MS);
       const task = await client.getTask(taskId, agentId).catch((e) => {
-        logger.warn(`openviking: phase2 getTask failed task_id=${taskId}: ${String(e)}`);
+        warnOrInfo(logger, `openviking: phase2 getTask failed task_id=${taskId}: ${String(e)}`);
         return null;
       });
       if (!task) {
@@ -465,18 +465,20 @@ async function pollPhase2ExtractionOutcome(
         return;
       }
       if (status === "failed") {
-        logger.warn(
+        warnOrInfo(
+          logger,
           `openviking: phase2 failed task_id=${taskId} session=${sessionLabel} error=${task.error ?? "unknown"}`,
         );
         return;
       }
     }
-    logger.warn(
+    warnOrInfo(
+      logger,
       `openviking: phase2 poll timeout (${PHASE2_POLL_MAX_MS / 1000}s) task_id=${taskId} session=${sessionLabel} — ` +
         `check GET /api/v1/tasks/${taskId}`,
     );
   } catch (e) {
-    logger.warn(`openviking: phase2 poll exception task_id=${taskId}: ${String(e)}`);
+    warnOrInfo(logger, `openviking: phase2 poll exception task_id=${taskId}: ${String(e)}`);
   }
 }
 
@@ -727,6 +729,15 @@ export function createMemoryOpenVikingContextEngine(params: {
 
         assembled.push(...ctx.messages.flatMap((m) => convertToAgentMessages(m)));
 
+        // 打印进入 session 的完整内容
+        logger.info(
+          `openviking: assemble entering session content for ${OVSessionId}: ` +
+            JSON.stringify(assembled.map((m) => ({
+              role: m.role,
+              content: typeof m.content === "string" ? m.content.substring(0, 100) : "[complex]",
+            })), null, 2),
+        );
+
         normalizeAssistantContent(assembled);
         const sanitized = sanitizeToolUseResultPairing(assembled as never[]) as AgentMessage[];
 
@@ -835,9 +846,9 @@ export function createMemoryOpenVikingContextEngine(params: {
             ? afterTurnParams.prePromptMessageCount
             : 0;
 
-        const { texts: newTexts, newCount } = extractNewTurnTexts(messages, start);
+        const { messages: extractedMessages, newCount } = extractNewTurnMessages(messages, start);
 
-        if (newTexts.length === 0) {
+        if (extractedMessages.length === 0) {
           diag("afterTurn_skip", OVSessionId, {
             reason: "no_new_turn_messages",
             totalMessages: messages.length,
@@ -872,34 +883,35 @@ export function createMemoryOpenVikingContextEngine(params: {
         const client = await getClient();
         const createdAt = pickLatestCreatedAt(turnMessages);
 
-        // Group by OV role (user|assistant), merge adjacent same-role
-        const HEARTBEAT_RE = /\bHEARTBEAT(?:\.md|_OK)\b/;
-        const groups: Array<{ role: "user" | "assistant"; texts: string[] }> = [];
-        for (const msg of turnMessages) {
-          const text = extractSingleMessageText(msg);
-          if (!text) continue;
-          if (HEARTBEAT_RE.test(text)) continue;
-          const role = (msg as Record<string, unknown>).role as string;
-          const ovRole: "user" | "assistant" = role === "assistant" ? "assistant" : "user";
-          const content = ovRole === "user"
-            ? text.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, " ").replace(/\s+/g, " ").trim()
-            : text;
-          if (!content) continue;
-          const last = groups[groups.length - 1];
-          if (last && last.role === ovRole) {
-            last.texts.push(content);
-          } else {
-            groups.push({ role: ovRole, texts: [content] });
+        // 发送结构化消息：统一 role 为 user，通过 parts 区分类型
+        for (const msg of extractedMessages) {
+          const ovParts = msg.parts.map((part) => {
+            if (part.type === "text") {
+              // 清理 relevant-memories 块
+              const cleaned = part.text
+                .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+              return { type: "text" as const, text: cleaned };
+            } else {
+              return {
+                type: "tool" as const,
+                tool_name: part.toolName,
+                tool_output: part.toolOutput,
+                tool_status: part.toolStatus,
+              };
+            }
+          });
+
+          if (ovParts.length > 0) {
+            await client.addSessionMessageWithParts(
+              OVSessionId,
+              msg.role, // 统一是 "user"
+              ovParts,
+              agentId,
+              createdAt,
+            );
           }
-        }
-
-        if (groups.length === 0) {
-          diag("afterTurn_skip", OVSessionId, { reason: "sanitized_empty" });
-          return;
-        }
-
-        for (const group of groups) {
-          await client.addSessionMessage(OVSessionId, group.role, group.texts.join("\n"), agentId, createdAt);
         }
 
         const session = await client.getSession(OVSessionId, agentId);
@@ -915,14 +927,10 @@ export function createMemoryOpenVikingContextEngine(params: {
         }
 
         const commitResult = await client.commitSession(OVSessionId, { wait: false, agentId });
-        const allTexts = groups.flatMap((g) => g.texts).join("\n");
-        const commitExtra = cfg.logFindRequests
-          ? ` ${toJsonLog({ captured: [trimForLog(allTexts, 260)] })}`
-          : "";
         logger.info(
           `openviking: committed session=${OVSessionId}, ` +
             `status=${commitResult.status}, archived=${commitResult.archived ?? false}, ` +
-            `task_id=${commitResult.task_id ?? "none"}${commitExtra}`,
+            `task_id=${commitResult.task_id ?? "none"}`,
         );
 
         diag("afterTurn_commit", OVSessionId, {
@@ -1110,8 +1118,14 @@ export function createMemoryOpenVikingContextEngine(params: {
         let tokensAfter: number | undefined;
         let contextFetchError: string | undefined;
 
+        let ctx: Awaited<ReturnType<typeof client.getSessionContext>> | undefined;
         try {
-          const ctx = await client.getSessionContext(OVSessionId, tokenBudget, agentId);
+          ctx = await client.getSessionContext(OVSessionId, tokenBudget, agentId);
+          // 打印完整的 getSessionContext 结果
+          logger.info(
+            `openviking: compact getSessionContext raw result for ${OVSessionId}: ` +
+              JSON.stringify(ctx, null, 2),
+          );
           if (typeof ctx.latest_archive_overview === "string") {
             summary = ctx.latest_archive_overview.trim();
           }
@@ -1120,6 +1134,37 @@ export function createMemoryOpenVikingContextEngine(params: {
             Number.isFinite(ctx.estimatedTokens)
           ) {
             tokensAfter = ctx.estimatedTokens;
+          }
+          // 打印 compact 后重新写入 session 的完整内容
+          logger.info(
+            `openviking: compact restored session content for ${OVSessionId}: ` +
+              `messages=${ctx.messages?.length ?? 0}, ` +
+              `latestArchiveOverview=${summary.length > 0 ? "present" : "empty"} (${summary.length} chars), ` +
+              `preArchiveAbstracts=${ctx.pre_archive_abstracts?.length ?? 0}, ` +
+              `estimatedTokens=${ctx.estimatedTokens}`,
+          );
+          if (summary.length > 0) {
+            logger.info(
+              `openviking: compact latest_archive_overview for ${OVSessionId}: ${summary.substring(0, 200)}...`,
+            );
+          }
+          if (ctx.messages && ctx.messages.length > 0) {
+            // 打印所有消息的 role 和 content 摘要
+            const msgSummary = ctx.messages.map((m: { role?: string; content?: string; parts?: Array<{ type?: string; text?: string }> }) => {
+              const role = m.role ?? "unknown";
+              let textPreview = "";
+              if (m.content) {
+                textPreview = m.content.substring(0, 80);
+              } else if (m.parts && m.parts.length > 0) {
+                const textPart = m.parts.find((p: { type?: string }) => p.type === "text");
+                textPreview = textPart?.text?.substring(0, 80) ?? JSON.stringify(m.parts).substring(0, 80);
+              }
+              return { role, textPreview };
+            });
+            logger.info(
+              `openviking: compact restored messages for ${OVSessionId}: ` +
+                JSON.stringify(msgSummary),
+            );
           }
         } catch (ctxErr) {
           contextFetchError = String(ctxErr);
