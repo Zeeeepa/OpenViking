@@ -513,8 +513,9 @@ export function extractNewTurnMessages(
   let count = 0;
 
   // First pass: collect toolUse inputs indexed by toolCallId/toolUseId
+  // Scan all messages (including after startIndex) to find toolUse before each toolResult
   const toolUseInputs: Record<string, Record<string, unknown>> = {};
-  for (let i = 0; i < startIndex && i < messages.length; i++) {
+  for (let i = 0; i < messages.length; i++) {
     const msg = messages[i] as Record<string, unknown>;
     if (!msg || typeof msg !== "object") continue;
     const role = msg.role as string;
@@ -523,10 +524,11 @@ export function extractNewTurnMessages(
       if (Array.isArray(content)) {
         for (const block of content) {
           const b = block as Record<string, unknown>;
-          if (b?.type === "toolUse" || b?.type === "tool_call") {
+          // Handle toolCall, toolUse, tool_call types
+          if (b?.type === "toolCall" || b?.type === "toolUse" || b?.type === "tool_call") {
             const id = (b.id as string) || (b.toolUseId as string) || (b.toolCallId as string);
-            // Try multiple field names for tool input
-            const input = b.input ?? b.arguments ?? b.toolInput;
+            // Try multiple field names for tool input: arguments, input, toolInput
+            const input = b.arguments ?? b.input ?? b.toolInput;
             if (id && input && typeof input === "object") {
               toolUseInputs[id] = input as Record<string, unknown>;
             }
